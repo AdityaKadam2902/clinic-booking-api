@@ -278,9 +278,11 @@ book(patient, slot_id, idem_key):
 - Pool sized above the race test's thread count so the test measures locking, not pool starvation.
 
 **SQLite**
-- `with_for_update()` is ignored by SQLAlchemy on SQLite. Instead an engine `begin` listener emits `BEGIN IMMEDIATE` for all service transactions, which takes the write lock up front and serializes writers. Check-then-insert is therefore safe.
+- `with_for_update()` is ignored by SQLAlchemy on SQLite. Auth key lookups and read-only GETs use a plain deferred session. Write use cases run through the Unit of Work, whose `begin` listener emits `BEGIN IMMEDIATE`, taking the write lock up front and serializing writers. Check-then-insert is therefore safe.
+- Use SQLAlchemy's documented pysqlite workaround: set the driver `isolation_level=None` in the `connect` event, then emit `BEGIN` / `BEGIN IMMEDIATE` explicitly in the `begin` event.
 - Pragmas on connect: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
 - Use a file database for tests (in-memory databases are per-connection and break multi-threaded tests).
+- A test proves a write use case holds the write lock: while it is open, a second connection with `busy_timeout=0` attempting `BEGIN IMMEDIATE` fails with "database is locked".
 - This asymmetry is documented honestly in the README: Postgres has finer-grained locks, SQLite serializes all writers. The guarantee is identical.
 
 ---
@@ -504,6 +506,7 @@ clinic-booking-api/
 - `test_unique_index_rejects_second_confirmed_booking_inserted_directly` (bypasses the service, proving the DB backstop)
 - `test_migrated_schema_has_expected_constraints`
 - `test_utc_roundtrip_preserves_timezone_on_sqlite` (G8)
+- `test_write_use_case_holds_sqlite_write_lock` (a second connection with `busy_timeout=0` gets "database is locked" while the UoW is open)
 
 About 30 tests, each named after the rule it protects. The suite reads as documentation of the booking rules.
 
@@ -527,10 +530,12 @@ About 30 tests, each named after the rule it protects. The suite reads as docume
 | `make install` | venv and dev dependencies |
 | `make run` | migrate and start on SQLite at `:8000` |
 | `make test` | full suite on SQLite, no Docker needed |
-| `make test-pg` | full suite against Postgres via Compose |
+| `make test-pg` | full suite against Postgres (requires `TEST_DATABASE_URL`; start the db with `docker compose up -d db`) |
 | `make lint` | ruff and mypy |
 | `make demo` | starts the app, fires 20 concurrent bookings, prints the outcome |
 | `docker compose up` | API and Postgres, ready in one step |
+
+Every target above also has its exact raw PowerShell and bash command in the README, so `make` is optional.
 
 ### 9.2 CI (GitHub Actions)
 
@@ -552,9 +557,9 @@ This turns the correctness claim into something a reviewer can see in seconds.
 ### 9.4 README outline
 
 1. One-paragraph summary, CI badge, and a link to the architecture notes
-2. Quick start: `make run` (no Docker) and `docker compose up` (Postgres)
+2. Quick start: `make run` (no Docker) and `docker compose up` (Postgres). Next to every Make target, show the exact raw command it runs in PowerShell and bash (where they differ), so `make` is optional.
 3. Run the tests: `make test`, `make test-pg`
-4. **How double-booking is prevented**: the three layers and the race matrix in about 20 lines
+4. **How double-booking is prevented**: the three layers, the SQLite deferred/`IMMEDIATE` split, and the race matrix in about 20 lines
 5. Endpoint table, then end-to-end `curl` walk-through: register, publish, book, double-book (409), cancel, rebook
 6. Error format and code catalog
 7. Business rules and domain assumptions (A1–A6)
@@ -624,11 +629,12 @@ If behind at 3:45: drop API keys for header identity, skip batch and filters pol
 | Alembic autogenerate drops partial indexes or exclusion constraints | Hand-write the migration, assert constraints in a schema test |
 | `btree_gist` unavailable on a managed Postgres | **Hard requirement** on Postgres: the migration fails fast if `CREATE EXTENSION btree_gist` cannot succeed. The official image includes it; README notes the requirement. |
 | Flaky race tests | Barrier release, outcome-count assertions, no sleeps, pool larger than thread count |
-| SQLite "database is locked" under threads | WAL, `busy_timeout`, `IMMEDIATE`, file DB for tests |
+| SQLite "database is locked" under threads | Deferred sessions for auth/reads; `BEGIN IMMEDIATE` only for write use cases via the UoW; WAL, `busy_timeout`, file DB for tests; a lock test asserts a second `BEGIN IMMEDIATE` with `busy_timeout=0` fails while a write UoW is open. |
 | Naive datetimes sneaking in through SQLite | `UTCDateTime` plus a dedicated test |
 | Time-dependent tests drifting | Everything uses `Clock`, never `datetime.now()` in rules |
 | Over-building and missing the time box | Tier cut lines in Section 11 |
 | Reviewer's Python version | `requires-python >= 3.11`, CI on 3.11 and 3.12 |
+| Reviewer on Windows without `make` | README lists the exact raw PowerShell and bash command for every Make target |
 
 ### 13.2 Definition of done (check before submitting)
 
@@ -640,7 +646,7 @@ If behind at 3:45: drop API keys for header identity, skip batch and filters pol
 - [ ] Every error response uses the envelope and carries a `request_id`
 - [ ] `/docs` shows all endpoints with error responses and examples
 - [ ] `ruff` and `mypy --strict` clean, CI green on SQLite and Postgres
-- [ ] README has setup, endpoint table, `curl` examples (including a failing one), test instructions, assumptions, trade-offs
+- [ ] README has setup, endpoint table, `curl` examples (including a failing one), test instructions, assumptions, trade-offs, and the exact raw PowerShell/bash command behind every Make target
 - [ ] No secrets, no `*.db` files, no stray debug code committed
 - [ ] Commit history is clean, with meaningful messages (scaffold, schema, services, API, tests, docs)
 - [ ] Repository is public (or access is granted) and the link is submitted on HireSol
@@ -696,7 +702,7 @@ A slot cancel returns `{slot, cancelled_booking}`. `cancelled_booking` is the fu
 
 - Use a plain deferred session for the auth key lookup and for read-only GETs.
 - Use `BEGIN IMMEDIATE` only for write use cases, issued by the Unit of Work.
-- Use SQLAlchemy's documented pysqlite workaround: set the driver `isolation_level=None` in the connect event and emit an explicit `BEGIN` in the begin event.
+- Use SQLAlchemy's documented pysqlite workaround: set the driver `isolation_level=None` in the connect event and emit an explicit `BEGIN` / `BEGIN IMMEDIATE` in the begin event.
 - Add a test proving a write use case holds the write lock: while it is open, a second connection with `busy_timeout=0` attempting `BEGIN IMMEDIATE` gets "database is locked".
 
 ### 14.7 Race tests
@@ -726,4 +732,4 @@ A slot cancel returns `{slot, cancelled_booking}`. `cancelled_booking` is the fu
 
 - Concurrent duplicate patient email: catch the unique violation and return **409 `EMAIL_ALREADY_REGISTERED`**. Normalize the address with the email validator, then lowercase it.
 - `/ready` runs `SELECT 1` and verifies that `alembic_version` equals the head revision.
-- `make test-pg` requires `TEST_DATABASE_URL`. The README documents `docker compose up -d db` and the URL to use. Every Make target also has a raw PowerShell and bash command in the README.
+- `make test-pg` requires `TEST_DATABASE_URL`. The README documents `docker compose up -d db` and the URL to use. Next to every Make target, the README shows the exact raw command it runs in PowerShell and bash (where they differ), so install, run, test, lint and demo work without `make`.

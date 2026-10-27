@@ -16,7 +16,7 @@ Python 3.11+, FastAPI (sync endpoints), SQLAlchemy 2.0 (sync), Alembic, Pydantic
 
 1. **The double-booking guarantee is three layers:** slot row lock, rule checks inside the lock, and the partial unique index as backstop. Never rely on an application check alone. Never remove a layer to make a test pass.
 2. **Schema comes from Alembic migrations only.** Never call `Base.metadata.create_all()`, not in app code and not in tests.
-3. **SQLite needs `BEGIN IMMEDIATE`.** `with_for_update()` does nothing on SQLite. Service transactions must run `IMMEDIATE` there via an engine event, with WAL, `busy_timeout` and `foreign_keys=ON`.
+3. **SQLite needs `BEGIN IMMEDIATE` for writes.** `with_for_update()` does nothing on SQLite. Auth lookups and read-only GETs use a plain deferred session; write use cases run `BEGIN IMMEDIATE` through the Unit of Work, using SQLAlchemy's pysqlite workaround (`isolation_level=None` in the connect event, explicit `BEGIN`/`BEGIN IMMEDIATE` in the begin event), with WAL, `busy_timeout` and `foreign_keys=ON`.
 4. **All timestamps are timezone-aware UTC.** Reject naive datetimes at the API. Use the `UTCDateTime` type so SQLite round-trips stay aware.
 5. **Never call `datetime.now()` / `datetime.utcnow()` in rules or services.** Take `now` from the injected `Clock`.
 6. **Lock order is patient, then slot, then booking.** Endpoints that start from a booking id use read, lock slot, re-read.
@@ -50,6 +50,8 @@ Python 3.11+, FastAPI (sync endpoints), SQLAlchemy 2.0 (sync), Alembic, Pydantic
 | `make test-pg` | full suite on Postgres (needs `TEST_DATABASE_URL`) |
 | `make lint` | ruff check, ruff format --check, mypy |
 | `make demo` | race demo script |
+
+Every target also has its exact raw PowerShell and bash command in the README, so install, run, test, lint and demo work without `make`.
 
 Run `make lint test` before reporting any phase complete.
 
