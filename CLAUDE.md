@@ -6,6 +6,8 @@ You are building a take-home submission for a Full Stack Developer Intern role. 
 
 `ARCHITECTURE.md` in this repo is the spec. Read the sections named in each phase prompt before writing code. If the spec and these rules conflict, these rules win. If the spec is silent or ambiguous, stop and ask. Do not guess on anything that touches concurrency, time, or the schema.
 
+`ARCHITECTURE.md` §14 overrides earlier sections.
+
 ## Stack (fixed, do not substitute)
 
 Python 3.11+, FastAPI (sync endpoints), SQLAlchemy 2.0 (sync), Alembic, Pydantic v2, pydantic-settings, psycopg 3 for Postgres, SQLite for zero-setup, pytest, httpx, ruff, mypy.

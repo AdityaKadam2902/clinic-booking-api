@@ -67,7 +67,7 @@ If time runs short, cut in this order: Tier 2, then batch/filters polish, then A
 - **A2. Capacity is exactly 1.** A slot holds one confirmed booking at a time.
 - **A3. Cancelling keeps history.** Slots and bookings are never deleted. A cancelled booking frees the slot for rebooking.
 - **A4. A clinic cancelling a booked slot cancels the booking** in the same transaction (`cancelled_by = clinic`).
-- **A5. Everything started is final.** A slot that has started cannot be booked or cancelled, and its bookings cannot be cancelled.
+- **A5. A started slot can no longer change state; repeating a completed cancel stays 200.** Once `now >= starts_at`, bookings and slot state transitions are rejected with `SLOT_STARTED`; a cancel of an already-cancelled resource still returns 200 (§14.3).
 - **A6. All timestamps are UTC.** Input must carry an offset and is normalized to UTC. Naive datetimes are rejected.
 
 ### 2.3 Deliberate non-goals
@@ -217,9 +217,11 @@ The `EXISTS` is served by the partial unique index, so listing stays an index sc
 
 Three independent layers, so a bug in one cannot cause a double-booking:
 
-1. **Serialization:** every state change on a slot happens while holding that slot's row lock. The slot row is the per-slot mutex.
+1. **Serialization:** every state change on a slot happens while holding that slot's row lock. The slot row is the per-slot mutex (on SQLite, serialization is the global writer lock taken by `BEGIN IMMEDIATE`; §5.5).
 2. **Rule checks inside the lock:** the service verifies status, time and existing booking while holding it, which gives clean errors and correct decisions.
-3. **Database backstop:** the partial unique index (and the exclusion constraint) reject any write that would violate the invariant, even if the code were wrong. A test proves this by bypassing the service.
+3. **Database backstop:** the database enforces exactly two booking-related invariants: **at most one confirmed booking per slot** (partial unique index) and **no overlapping open slots per clinic** (Postgres exclusion constraint). Any write that would violate either is rejected even if the code is wrong. A test proves the first by bypassing the service.
+
+The invariant "a cancelled slot never has a confirmed booking" is **not** enforced by a database constraint. It is enforced by the service inside the slot lock (the cascade) and proven by the R2 test. See §14.1.
 
 ### 5.2 Race matrix
 
@@ -334,7 +336,7 @@ Base path `/v1`. JSON only. All times ISO-8601 with offset, returned in UTC (`Z`
 | List a clinic's bookings | that clinic |
 
 - Status semantics: 401 for missing or invalid key, 403 for authenticated but not permitted (used uniformly, for easy explanation and testing).
-- Fallback if time runs short: headers `X-Clinic-Id` / `X-Patient-Id`, documented as a stand-in. Same ownership logic, weaker identity.
+- The key prefix selects the lookup table (`clk_` → clinics, `pat_` → patients). An unknown key returns 401; a valid key of the wrong kind returns 403.
 
 ### 6.4 Validation rules
 
@@ -620,7 +622,7 @@ If behind at 3:45: drop API keys for header identity, skip batch and filters pol
 | Risk | Mitigation |
 |---|---|
 | Alembic autogenerate drops partial indexes or exclusion constraints | Hand-write the migration, assert constraints in a schema test |
-| `btree_gist` unavailable on a managed Postgres | Official image has it. README notes the requirement. Service-level overlap check still works without it. |
+| `btree_gist` unavailable on a managed Postgres | **Hard requirement** on Postgres: the migration fails fast if `CREATE EXTENSION btree_gist` cannot succeed. The official image includes it; README notes the requirement. |
 | Flaky race tests | Barrier release, outcome-count assertions, no sleeps, pool larger than thread count |
 | SQLite "database is locked" under threads | WAL, `busy_timeout`, `IMMEDIATE`, file DB for tests |
 | Naive datetimes sneaking in through SQLite | `UTCDateTime` plus a dedicated test |
@@ -642,3 +644,86 @@ If behind at 3:45: drop API keys for header identity, skip batch and filters pol
 - [ ] No secrets, no `*.db` files, no stray debug code committed
 - [ ] Commit history is clean, with meaningful messages (scaffold, schema, services, API, tests, docs)
 - [ ] Repository is public (or access is granted) and the link is submitted on HireSol
+
+---
+
+## 14. Errata and decisions (v2.1)
+
+This section supersedes any conflicting statement in Sections 1–13. `CLAUDE.md` records the rule that §14 overrides earlier sections. Tier 2 remains out of scope; only R1–R7 are required.
+
+### 14.1 Backstop scope and Postgres requirements
+
+- `btree_gist` is a **hard requirement** on Postgres. The migration fails fast if `CREATE EXTENSION btree_gist` cannot succeed. The earlier claim that the service-level overlap check still works without it is withdrawn: slot creation takes no row lock, so without the exclusion constraint two concurrent overlapping inserts can both succeed.
+- Slot creation is protected by the Postgres exclusion constraint or by SQLite `BEGIN IMMEDIATE`. It takes no row lock and is **outside the lock order**.
+- The database enforces exactly two booking-related invariants: **at most one confirmed booking per slot** (partial unique index) and **no overlapping open slots per clinic** (Postgres exclusion constraint).
+- "A cancelled slot never has a confirmed booking" is enforced by the service inside the slot lock (the cascade) and proven by the R2 test. It is **not** enforced by a database constraint.
+
+### 14.2 Idempotency
+
+- Idempotency keys are scoped per patient, immutable, and never expire.
+- A replay returns **200** with the original booking in its **current** state, even if it has since been cancelled. The response carries `Idempotent-Replay: true` and no `Location` header.
+- To book again after a cancellation, the client must use a new key.
+- Same key and same slot returns the replay; same key and a different slot returns **422 `IDEMPOTENCY_KEY_MISMATCH`**. Keys are case-sensitive.
+- Concurrent same key, different slots, on Postgres: on an `IntegrityError` for `booking_idempotency`, roll back, open a **new** transaction, and re-read by `(patient_id, key)`. Same slot returns the replay; different slot returns 422. A test covers this.
+
+### 14.3 Cancel truth table
+
+For both booking cancel and slot cancel, in this order:
+
+1. If the resource is already cancelled: return **200** with a no-op body, even if the slot has started.
+2. Otherwise, if `now >= starts_at`: return **409 `SLOT_STARTED`**.
+3. Otherwise: apply the transition.
+
+A slot cancel returns `{slot, cancelled_booking}`. `cancelled_booking` is the full booking object cancelled by this slot cancellation, or `null`. The slot and the cascaded booking use the **same** `cancelled_at` value, so a repeat call returns the same body.
+
+### 14.4 Dialect DDL and time
+
+- DDL is written per dialect. Use `length()` (available on both databases) instead of `char_length()`. There is no `EXCLUDE` constraint on SQLite. The migration branches on dialect.
+- On SQLite, `UTCDateTime` stores one fixed canonical UTC string form so that string ordering matches chronological ordering. It returns aware datetimes, and API output serializes with `Z`. A round-trip test and an ordering test cover this.
+- `started` means `now >= starts_at`.
+- The 365-day horizon and the 5- and 480-minute duration limits are inclusive.
+
+### 14.5 Error mapping
+
+- Map to **503 `SERVICE_UNAVAILABLE`** only connection-level failures and SQLite "database is locked" after `busy_timeout` is exhausted. Other `OperationalError`s are **500 `INTERNAL_ERROR`**.
+- Translate `IntegrityError` by constraint or index name in **one central function**, on both dialects:
+  - `one_confirmed_booking_per_slot` → `SlotAlreadyBooked`
+  - `booking_idempotency` → replay or `IDEMPOTENCY_KEY_MISMATCH` (see §14.2)
+  - the patients email unique constraint → `EmailAlreadyRegistered`
+  - the Postgres exclusion constraint → `SlotOverlap`
+
+### 14.6 SQLite transactions
+
+- Use a plain deferred session for the auth key lookup and for read-only GETs.
+- Use `BEGIN IMMEDIATE` only for write use cases, issued by the Unit of Work.
+- Use SQLAlchemy's documented pysqlite workaround: set the driver `isolation_level=None` in the connect event and emit an explicit `BEGIN` in the begin event.
+- Add a test proving a write use case holds the write lock: while it is open, a second connection with `busy_timeout=0` attempting `BEGIN IMMEDIATE` gets "database is locked".
+
+### 14.7 Race tests
+
+- One session per worker, a file database, and a pool size greater than the thread count (or `NullPool`). No shared test-client session, no sleeps.
+
+### 14.8 Scope and lock order
+
+- Tier 2 is out of scope entirely; `CLAUDE.md` wins. Only R1–R7 are required.
+- The global lock order remains patient → slot → booking. The **patient and booking levels are reserved and unused**.
+- Slot creation is outside the lock order (§14.1).
+
+### 14.9 Authentication
+
+- Bearer API keys only. The header-based fallback (`X-Clinic-Id` / `X-Patient-Id`) is deleted.
+- The key prefix selects the lookup table (`clk_` → clinics, `pat_` → patients). An unknown key returns **401**; a valid key of the wrong kind returns **403**.
+- 403-after-existence reveals that a resource exists. The README states explicitly that this is a deliberate trade-off.
+
+### 14.10 Listing, filters and pagination
+
+- Slot listing `from`/`to` means `starts_at` ∈ `[from, to)`, half-open.
+- A slot cursor is a position only: `(starts_at, id)`. It is not bound to filters. A malformed cursor returns **422 `INVALID_CURSOR`**.
+- Booking lists (patient and clinic) are ordered by `created_at DESC, id DESC` with a `(created_at, id)` cursor.
+- An unknown clinic on `GET /v1/clinics/{clinic_id}/slots` returns **404 `CLINIC_NOT_FOUND`**.
+
+### 14.11 Registration, readiness and developer workflows
+
+- Concurrent duplicate patient email: catch the unique violation and return **409 `EMAIL_ALREADY_REGISTERED`**. Normalize the address with the email validator, then lowercase it.
+- `/ready` runs `SELECT 1` and verifies that `alembic_version` equals the head revision.
+- `make test-pg` requires `TEST_DATABASE_URL`. The README documents `docker compose up -d db` and the URL to use. Every Make target also has a raw PowerShell and bash command in the README.
